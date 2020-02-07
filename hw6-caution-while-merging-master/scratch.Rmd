@@ -1,0 +1,220 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+invisible(library(tidyverse))
+library(darksky)
+```
+
+```{r}
+Sys.setenv("DARKSKY_API_KEY" = "205d3f20407e1f574fbf7711217ea681")
+weather_2014 <- seq(as.Date('2014-01-01'), as.Date('2015-01-01'), "1 day") %>%
+ map(~get_forecast_for(38.9072,-77.0369, .x)) %>%
+ map_df("hourly")
+weather_2018 <- seq(as.Date('2018-01-01'), as.Date('2019-01-01'), "1 day") %>%
+ map(~get_forecast_for(38.9072,-77.0369, .x)) %>%
+ map_df("hourly")
+```
+
+```{r}
+# Useful function for splitting time into relevant coulumns
+parse_dates <- function(data, col_name) {
+  return(data %>% separate(col = col_name, 
+                           into = c("year", "month", "day", "hr"), 
+                           sep = "-|\\s|:",
+                           extra = "drop"))
+}
+
+# Given the hour of the data, returns a bucket for that hour
+add_tod <- function(data) {
+  return(data %>% mutate(hr = as.numeric(hr)) %>% 
+           mutate(time = case_when(hr < 5 ~ "Late night",
+                                   hr < 11 ~ "Morning",
+                                   hr < 18 ~ "Afternoon",
+                                   hr <= 23 ~ "Night")))
+}
+
+weather_2014 <- weather_2014 %>% parse_date()
+```
+
+
+```{r}
+bike_data <- data.frame()
+for(i in 2013:2017) {
+  curr_bike <- read_csv(paste0("bike_data/cbs_", i, ".csv"))
+  bike_data <- rbind(bike_data, curr_bike)
+}
+colnames(bike_data) <- make.names(colnames(bike_data))
+```
+
+```{r}
+bike_data <- parse_dates(bike_data, "Start.date")
+bike_data <- bike_data %>% mutate(hr = as.numeric(hr)) %>% add_tod()
+```
+
+
+```{r}
+set.seed(523)
+bike_small <- sample_n(bike_data, 1000000)
+```
+
+
+## Actual distance measuring
+
+```{r}
+dist <- bike_data %>% 
+  group_by(End.station.number, Start.station.number) %>% 
+  summarise(mean = sum(Duration) / n(), n = n()) %>% ungroup()
+```
+
+As we don't have any way to measure the actual distance between stops, we will use duration as a proxy. The logic being that duration is strongly correlated with distance; holding all else constant, a bike ride with a longer duration is likely going to be further. To this end, we have computed the average distance between any two stops. There are a few issues with this, namely that:
+
+```{r}
+dist %>% count(n < 5)
+```
+
+About a third of our observations have had less than 5 people ride between them. Unfortunately, you could argue that these stops are close OR far.
+
+- Close: There's no reason to bike between two stops if they're right next to each other. Why not walk?
+- Far: If 2 stops are really far away from each, a car/public transportation might be more attractive.
+
+## Member Type
+
+There are 3 types of member types for the bike share data: member, casual, and unknown. We hypothesize that, all else being equal, if a member and a casual ride for the same duration, the member likely went further, and we would like to predict a further stop. The logic being that members likely bike more and know the routes better. Hence, they would have a higher average mph. Let's look into it:
+
+```{r}
+bike_data %>% filter(Member.type != "Unknown") %>% 
+  group_by(Member.type) %>% summarise(avg = sum(Duration) / n(), n = n())
+```
+
+As we suspected. If we assume that casuals and members are generally biking the same distances (potentially a big assumption), then members are on their bikes for about a third as long
+
+## Year
+
+Perhaps there is a trend in the year for bikers. Maybe as people are getting more used to these bikes, they're moving around with more confidence and at a faster pace. Let's add the relevant columns and test:
+
+```{r}
+# Split start time into relevant columns with regex
+bike_small <- parse_dates(bike_small, "Start.date")
+
+# Add bins for time of day
+bike_small <- bike_small %>% mutate(hr = as.numeric(hr))
+bike_small <- add_tod(bike_small)
+```
+
+```{r}
+bike_small %>% group_by(year) %>% summarise(avg = sum(Duration) / n(), n =  n())
+```
+
+The average duration is increasing over the years. Again, if we're using duration as our proxy for distance and assumming that people are still generally biking between the same stops, we have reason to believe that (on average) people are biking faster. Therefore, for 2018 we will predict slightly further than we would for previous years.
+
+## Time of day
+
+We hypothesize that, for any two given rides with the duration, a ride at night will have a faster mph. There are less people/cars around in the early morning hours, so bikers could have a faster average mph. Let's check:
+
+```{r}
+bike_tod <- bike_small %>% group_by(hr) %>% summarise(avg = sum(Duration) / n(), n = n())
+ggplot(bike_tod, aes(x = hr, y = avg, group = 1)) + geom_line()
+```
+
+From the graph, nighttime (5 pm - 4 am) rides have a faster average mph under the assumption that time of day is not correlated with distance between stops. What is suprising, however, are the hours of 5 am - 9 am; these rides have the lowest average duration. We typically think of early birds as healthy, active people. So if someone is riding a bike at this hour, they are likely in great physical shape. As a result, they likely bike at a faster pace.
+
+## Time of year
+
+We hypothesize that, for any 2 rides with the same duration, a ride in the middle of the year has a faster speed than a ride in the winter. We think this because wind/snow would slow down your ride. People are likely biking shorter distances in the winter though, so it might be hard to use these results to infer that a summer ride is quicker. We'll check anyway:
+
+```{r}
+bike_small %>% group_by(month) %>% summarise(avg = sum(Duration) / n(), n = n())
+```
+
+The results disagree with our initial thoughts. In the winter (Nov - Feb), the average duration is much lower than Spring/Summer/Fall. This could be because people are generally taking shorter trips in the winter (as stated above), but perhaps another meaning arises. Maybe the cold motivates people to bike really fast and get to where they need to be at a much quicker pace. 
+
+## Testing
+
+Need a table that relates end points to names
+
+## Adding weather to dataframe
+
+Add good/bad weather
+
+Test with small dataframe first:
+
+```{r}
+bike_small_2014 <- bike_small %>% filter(year == 2014)
+bike_small_2014$weather <- ""
+for(i in seq_len(nrow(bike_small_2014))) {
+  bike_small_2014[i, "weather"] <- weather_2014 %>% filter(year == bike_small_2014[i, "year"][[1]], 
+                                   month == bike_small_2014[i, "month"][[1]],
+                                   day == bike_small_2014[i, "day"][[1]]) %>% .[1, "icon"]
+}
+```
+
+```{r}
+bad_weather <- c("rain", "sleet", "snow")
+bike_small <- bike_small %>% mutate(weather = subset(weather_2014, year == bike_small$year, month == bike_small$month, day == bike_small$day, hr == bike_small$hr)$icon)
+```
+
+```{r}
+test <- read_csv("bike_data/cbs_test.csv", progress = F)
+test <- parse_dates(test, "start_date")
+
+test <- test %>% mutate(hr = as.numeric(hr))
+test <- add_tod(test)
+
+# Set all values equal to 0
+test[, 11:ncol(test)] <- 0
+```
+
+```{r}
+# Predict that rides are similar based off of previous rides. For this, we are figuring duration,
+#   time of day, time of year, and weather are the most important variables
+predict_row <- function(test_obs, duration_diff = 10) {
+  print("RUNNING")
+  test_res <- bike_small %>% 
+    filter(month == test_obs[[2]],
+           Duration < test_obs[[8]] + duration_diff,
+           Duration > test_obs[[8]] - duration_diff) %>% 
+    mutate(total = n()) %>% 
+    group_by(End.station) %>% 
+    summarise(prob = n() / total[1])
+  
+    #apply(test_res, 1, function(stop) test_backup[stop$End.station] <- "AHHHHH")
+    apply(test_res, 1, function(stop) test_backup[stop[1]] <- stop[2])
+
+}
+
+res <- apply(test_wdates, 1, predict_row)
+```
+
+```{r}
+duration_diff <- 5
+
+# With for loop
+for(i in 1:nrow(test)) {
+  obs <- test[i,]
+  
+  # Filter for similar rides, and find their frequencies
+  test_res <- bike_data %>% 
+    filter(month == obs$month,
+           Duration < obs$duration + duration_diff,
+           Duration > obs$duration - duration_diff,
+           time == obs$time) %>% 
+    mutate(total = n()) %>% 
+    group_by(End.station) %>% 
+    summarise(prob = n() / total[1])
+  
+  if(nrow(test_res) == 0) {next}
+  for(j in 1:nrow(test_res)) {
+    test[[i, test_res$End.station[j]]] <- test_res$prob[j]
+  }
+}
+```
+
+```{r}
+orig_test <- read_csv("bike_data/cbs_test.csv")
+submission <- test %>% select(-year, -month, -day, -hr, -time) %>% mutate(start_date = orig_test$start_date) %>% select(start_date, everything())
+write_csv(submission, "cbs_caution-while-merging.csv")
+```
+

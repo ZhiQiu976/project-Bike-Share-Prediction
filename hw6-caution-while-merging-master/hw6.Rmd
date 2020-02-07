@@ -1,0 +1,151 @@
+---
+title: "Homework 6"
+author: 'Cole Juracek, ..., ..., ...'
+date: "11/05/2019"
+output: 
+  html_document:
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, message = FALSE,
+                      warning = FALSE, cache = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse)
+library(profvis)
+```
+
+# Intro
+
+Capital Bikeshare is metro DC's bikeshare service. Our task for this homework was to use data from the previous years (2013-2017) to predict the end station for the most recent year (2018). Data in these files consists of qualitative (start and end stations), quantitative (duration), and date (start/end date) variables.
+
+# Task 1
+
+For task 1, we needed to compile the data from various sources into a manageable data frame. This consisted of two parts: merging the bike data from various years together, and obtaining the weather data.
+
+## Bike data
+
+The bike data was stored as a CSV at a base url, appended by the different years 2013-2017. A simple curl command with regex brought these data into our working directory. From here, we combined the 5 csv's into a singular data frame. This data frame is very large (15746368 x 13), so even simple manipulations can take a while. We can mitigate this via parallelizing our code and using a profiler to troubleshoot time intensive areas.
+
+```{r}
+bike_data <- readRDS("bike_data/bike_data.rds")
+head(bike_data)
+```
+
+## Weather
+
+We also need to obtain the weather data. Because an API key is needed every time we load the data, and we only have a limited number of calls per day, we cannot put this into our make file. We have it contained locally under "weather_data", and will assume it is local as needed to recreate the code. Aside from that, it was fairly easy to obtain the weather data. We specified the time constraints (one RDS/year), as well as the lat/long (D.C.). We are only interested in the 'icon' column; this will give us a good sense of the weather for the day, either good (e.g. clear-day, partly-cloudy, etc.) or bad (e.g. sleet, snow). 
+
+# Task 2
+
+## Pre-processing
+
+The main logic behind our model can be stated as the following: rides with similar conditions should have similar end points. For example, short late night rides in the winter will likely be different than long afternoon rides in the summer. From this, we would like to break up our data into more convenient columns. 
+
+First, we'll parse the date into its component parts. We expect that rides at different times of the year (specified by month) will be similar to each other. Namely in the winter, when the weather is bad, we expect the rides to be shorter. We don't predict that the minutes/seconds will play a role in prediction, so we do not include them
+
+```{r}
+# Separate bike data into pieces. Minutes/seconds not important
+parse_dates <- function(data, col_name) {
+  return(data %>% separate(col = col_name, 
+                           into = c("year", "month", "day", "hr"), 
+                           sep = "-|\\s|:",
+                           extra = "drop"))
+}
+
+# First, make column names valid
+colnames(bike_data) <- make.names(colnames(bike_data))
+
+bike_data <- bike_data %>% parse_dates("Start.date")
+```
+
+Next, we predict that time of day will be an important factor in predicting similar rides. Maybe late at night, people aren't going to be taking as long of rides; they likely just want to get home. Because of this, "hr" will be important. However, there shouldn't be too much variation between a ride at 2:00 am vs. 3:00 am. It makes more sense to split the time of day into bins. We'll define the times "morning", "afternoon", "night" and "late night" in 6 hour increments:
+
+```{r}
+# Given the hour of the data, returns a bucket for that hour
+add_tod <- function(data) {
+  return(data %>% mutate(hr = as.numeric(hr)) %>% 
+           mutate(time = case_when(hr < 5 ~ "Late night",
+                                   hr < 11 ~ "Morning",
+                                   hr < 18 ~ "Afternoon",
+                                   hr <= 23 ~ "Night")))
+}
+
+bike_data <- bike_data %>% add_tod()
+```
+
+Finally, there are some other predictors we would like to use to inform our decision. Duration is perhaps the biggest influencer in terms of where a ride will go. As we cannot infer a direction based off of the data, the distance traveled can tell us of a ring of likely bike stops. We do not have distance available, but we do have duration, which can be thought of as a proxy for distance. We would also like to match member types; it's likely that members bike more similar distances to members than non-members and vice versa. We predict that, on average, a member will bike to further stops.
+
+## Creating predictions
+
+First, we need to process the test data set in the same way
+
+```{r}
+test_data <- readRDS("bike_data/cbs_test.csv")
+test_data <- test_data %>% parse_dates("start_date") %>% add_tod()
+```
+
+We create our predictions as follows. As stated before, we're looking to obtain similar rides. To this end, we filter our bike data set such that
+
+1. The month matches the observation's month
+2. The time of day (in the 4 bins) matches the observation's time of day.
+3. The member type matches the observation's member type
+4. The duration is within a margin of error of the observation's duration. If we set this too large, we capture too many rides that aren't similar in duration times. But if we set it too small, we likely won't find enough rides to capture the average end stop. We'll try 10 for now, and adjust as needed.
+
+```{r Predictions}
+duration_diff <- 10
+for(i in 1:nrow(test)) {
+  obs <- test[i,]
+  
+  # Filter for similar rides, and find their frequencies
+  test_res <- bike_data %>% 
+    filter(month == obs$month,
+           time == obs$time,
+           Member.type == member_type,
+           Duration < obs$duration + duration_diff,
+           Duration > obs$duration - duration_diff) %>% 
+    mutate(total = n()) %>% 
+    group_by(End.station) %>% 
+    summarise(prob = n() / total[1])
+  
+  if(nrow(test_res) == 0) {next}
+  for(j in 1:nrow(test_res)) {
+    test[[i, test_res$End.station[j]]] <- test_res$prob[j]
+  }
+}
+```
+
+## Profiling
+
+The most computationally intensive part of this assignment by far is assigning the probabilities to different stations. This is due to a double for loop; one iterating through the different test observations, and the nested loop iterating through the likely stops for that station. Normally, we would try to use a member of the 'apply' family, but we need the column names. Apply drops column names.
+
+We'll use a profiler to see how this code chunk performs on a small subset of the data.
+
+```{r}
+test_small <- sample_frac(test, 0.01)
+
+profile <- profvis({for(i in 1:nrow(test_small)) {
+  obs <- test[i,]
+  
+  # Filter for similar rides, and find their frequencies
+  test_res <- bike_data %>% 
+    filter(month == obs$month,
+           time == obs$time,
+           Member.type == obs$member_type,
+           Duration < obs$duration + duration_diff,
+           Duration > obs$duration - duration_diff) %>% 
+    mutate(total = n()) %>% 
+    group_by(End.station) %>% 
+    summarise(prob = n() / total[1])
+  
+  if(nrow(test_res) == 0) {next}
+  for(j in 1:nrow(test_res)) {
+    test_small[[i, test_res$End.station[j]]] <- test_res$prob[j]
+  }
+}
+})
+```
+
+Our profile code shows nothing suprising. Essentially all of the time is spent in the "filter" command, which makes sense as the data frame is massive. The nested for loop, which might have initially been concerning, only spends about 1/62 as much time.
